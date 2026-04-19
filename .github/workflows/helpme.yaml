@@ -23,7 +23,7 @@ jobs:
 
             # Run TruffleHog to scan for secrets/ leaks in the codebase
             - name: Run TruffleHog
-              uses: trufflesecurity/trufflehog-action@v1
+              uses: trufflesecurity/trufflehog@main
               with:
                 args: --json --entropy=True --rules=rules.json .
               continue-on-error: true # This allows the workflow to continue because we know FOR SURE this gonna fail.
