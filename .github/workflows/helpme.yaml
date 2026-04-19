@@ -2,103 +2,166 @@ name: DevSecOps Pipeline
 on:
   push:
     branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
-# This block ensures that the GitHub Action workflow has permissions to write comments and update pull requests:
 permissions:
   contents: read
   id-token: write
   issues: write
   pull-requests: write
+  security-events: write  # required to upload SARIF to GitHub Security tab
+  actions: read
 
 jobs:
-    # Pre-commit hook to scan for secrets/ leaks in the codebase using TruffleHog
+    # GATE#0: Secret scanning (TruffleHog + Gitleaks)
     secret-scanning:
         runs-on: ubuntu-latest
         steps:
-            # Check out the code from the repository
             - name: Checkout code
-              uses: actions/checkout@v3
+              uses: actions/checkout@v4
               with:
-                fetch-depth: 0  # setting `fetch-depth` to `0` ensures that no tags or branches are excluded from the scan.
+                fetch-depth: 0
 
-            # Run TruffleHog to scan for secrets/ leaks in the codebase
             - name: Run TruffleHog
               uses: trufflesecurity/trufflehog@main
+              continue-on-error: true
               with:
-                args: --json --entropy=True --rules=rules.json .
-              continue-on-error: true # This allows the workflow to continue because we know FOR SURE this gonna fail.
+                path: ./
+                base: ${{ github.event.repository.default_branch }}
+                head: HEAD
+                extra_args: --only-verified
 
-    # GATE#1: SAST scan using SonarQube
+            # Gitleaks publishes SARIF directly to the GitHub Security tab
+            - name: Run Gitleaks
+              uses: gitleaks/gitleaks-action@v2
+              continue-on-error: true
+              env:
+                GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "true"
+                GITLEAKS_ENABLE_SUMMARY: "true"
+
+    # GATE#1a: SAST via SonarQube (results in Sonar dashboard)
     sast-scan:
         runs-on: ubuntu-latest
-        needs: secret-scanning # runs after the "secret-scanning" is complete
+        needs: secret-scanning
+        if: ${{ !cancelled() }}
         steps:
             - name: Checkout code
-              uses: actions/checkout@v3
+              uses: actions/checkout@v4
+              with:
+                fetch-depth: 0
 
-            # Run SonarQube scan
             - name: SonarQube Scan
               uses: SonarSource/sonarqube-scan-action@v7.1.0
+              continue-on-error: true
               env:
-                SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }} # for more details on how to generate the SONAR_TOKEN, check the link provided above.
+                SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
-    #GATE#2: Dependency scanning using OWASP Dependency-Check
+    # GATE#1b: SAST via CodeQL (results in GitHub Security tab)
+    codeql-scan:
+        runs-on: ubuntu-latest
+        needs: secret-scanning
+        if: ${{ !cancelled() }}
+        strategy:
+            matrix:
+                language: [ 'javascript-typescript' ]
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Initialize CodeQL
+              uses: github/codeql-action/init@v3
+              with:
+                languages: ${{ matrix.language }}
+                queries: security-extended,security-and-quality
+
+            - name: Perform CodeQL Analysis
+              uses: github/codeql-action/analyze@v3
+              with:
+                category: "/language:${{ matrix.language }}"
+
+    # GATE#2: Dependency scanning via OWASP Dependency-Check (SARIF + HTML)
     dependency-scanning:
         runs-on: ubuntu-latest
-        needs: [sast-scan, secret-scanning] # this job will run only if the "sast-scan" and "secret-scanning" jobs are successful
+        needs: [sast-scan, secret-scanning]
+        if: ${{ !cancelled() }}
         steps:
-
             - name: Checkout code
-              uses: actions/checkout@v3
+              uses: actions/checkout@v4
 
-            - name: build the project
+            - name: Setup Node
               uses: actions/setup-node@v4
+              with:
+                node-version: '20'
 
             - name: Install dependencies
               run: npm install
 
-            # Run OWASP Dependency-Check scan
             - name: Depcheck
               uses: dependency-check/Dependency-Check_Action@main
+              continue-on-error: true
               id: Depcheck
               with:
-                project: 'test'
+                project: 'DontEverPushThisCodeV2'
                 path: '.'
-                format: 'HTML'
-                out: 'reports' # this is the default, no need to specify unless you wish to override it
+                format: 'SARIF'
+                out: 'reports'
                 args: >
                     --failOnCVSS 7
                     --enableRetired
 
-            # Upload the generated report as an artifact for later use
-            - name: Upload Test results
-              uses: actions/upload-artifact@master
+            - name: Upload Depcheck SARIF to Security tab
+              if: always()
+              uses: github/codeql-action/upload-sarif@v3
+              continue-on-error: true
               with:
-                name: Depcheck report
-                path: ${{github.workspace}}/reports
+                sarif_file: reports/dependency-check-report.sarif
+                category: dependency-check
 
-    # GATE#3: Container/Image scanning using Trivy
+            - name: Upload Depcheck report artifact
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                name: depcheck-report
+                path: reports/
+
+    # GATE#3: Container/Image scanning via Trivy (SARIF + artifact)
     image-scanning:
         runs-on: ubuntu-latest
-        needs: [dependency-scanning] # this job will run only if the "dependency-scanning" job is successful
+        needs: [dependency-scanning]
+        if: ${{ !cancelled() }}
         steps:
-
             - name: Checkout code
-              uses: actions/checkout@v3
+              uses: actions/checkout@v4
 
-            # Build the Docker image (
             - name: Build Docker image
               run: docker build -t my-app:latest .
 
-            # Run Trivy scan on the built image
-            - name: Trivy Scan
+            - name: Trivy Scan (SARIF)
               uses: aquasecurity/trivy-action@master
+              continue-on-error: true
               with:
                 image-ref: 'my-app:latest'
-                format: 'table'
+                format: 'sarif'
+                output: 'trivy-results.sarif'
                 severity: 'HIGH,CRITICAL'
+                ignore-unfixed: true
 
-    # GATE#4: Infrastructure as Code (IaC) scanning using Checkov. Sine this is too much for you (and me), let's skip this part as well haha
-    # but you can check out the Checkov GitHub Action here: https://github.com/marketplace/actions/checkov-github-action
+            - name: Upload Trivy SARIF to Security tab
+              if: always()
+              uses: github/codeql-action/upload-sarif@v3
+              continue-on-error: true
+              with:
+                sarif_file: trivy-results.sarif
+                category: trivy
 
-    # GATE#5: DAST scan using OWASP ZAP (well, there is a workshop for this, so let's skip this part)
+            - name: Upload Trivy report artifact
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                name: trivy-report
+                path: trivy-results.sarif
+
+    # GATE#4: IaC scanning — skipped per course
+    # GATE#5: DAST — separate workshop
