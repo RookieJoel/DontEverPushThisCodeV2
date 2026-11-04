@@ -31,8 +31,10 @@ jobs:
               with:
                 path: ./
                 # TODO#2: scan only the commit diff
-                base: ${{ github.event.repository.default_branch }}
-                head: HEAD
+                # push to main: default_branch == HEAD -> "BASE and HEAD are the same" error.
+                # So use the real range: PR base..head, or push before..after.
+                base: ${{ github.event.pull_request.base.sha || github.event.before }}
+                head: ${{ github.event.pull_request.head.sha || github.sha }}
                 # TODO#3: report only verified (live) secrets
                 extra_args: --only-verified
 
