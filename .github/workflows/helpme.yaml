@@ -47,6 +47,20 @@ jobs:
                 GITLEAKS_ENABLE_UPLOAD_ARTIFACT: true
                 GITLEAKS_ENABLE_SUMMARY: true
 
+            # DEMO ONLY: the diff scans above never see old commits (e.g. .env.local from the
+            # initial commit), and --only-verified drops fake creds. Scan ALL history, unverified too.
+            - name: TruffleHog full history (demo)
+              run: |
+                docker run --rm -v "$PWD:/repo" -w /repo ghcr.io/trufflesecurity/trufflehog:latest \
+                  git file:///repo --results=verified,unknown --no-update --github-actions
+              continue-on-error: true
+
+            - name: Gitleaks full history (demo)
+              run: |
+                docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest detect \
+                  --source /repo --report-format sarif --report-path /repo/gitleaks-full.sarif --verbose
+              continue-on-error: true
+
     # GATE#1a: SAST via SonarQube
     sast-scan:
         runs-on: ubuntu-latest
